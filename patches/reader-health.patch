@@ -1,0 +1,440 @@
+diff --git a/packages/core/src/usenet/integration/dashboard/providers.ts b/packages/core/src/usenet/integration/dashboard/providers.ts
+index 0a47a617..00c23eb4 100644
+--- a/packages/core/src/usenet/integration/dashboard/providers.ts
++++ b/packages/core/src/usenet/integration/dashboard/providers.ts
+@@ -88,9 +88,9 @@ export async function saveUsenetProviders(
+   usenetEngineRegistry.invalidate();
+ }
+ 
+-/** Test a single provider connection (dial + auth + DATE health probe).
++/** Test a single provider connection (dial + auth + reader health probe).
+  *
+- * `latencyMs` in the result measures only the DATE command round-trip after the
++ * `latencyMs` in the result measures only a no-payload STAT round-trip after the
+  * connection (TCP/TLS/greeting/auth) is fully established, so it reflects the
+  * true server responsiveness rather than including connection setup overhead. */
+ export async function testUsenetProvider(
+@@ -128,9 +128,9 @@ export async function testUsenetProvider(
+       dialTimeoutMs: 15_000,
+       idleConnectionMs: 60_000,
+     });
+-    // Measure only the DATE round-trip; connection setup is already done.
++    // Measure only the reader probe; connection setup is already done.
+     const start = Date.now();
+-    await conn.date(signal, 15_000);
++    await conn.probeReader(signal, 15_000);
+     return { ok: true, latencyMs: Date.now() - start };
+   } catch (err) {
+     const code = err instanceof NntpError ? err.kind : 'unknown';
+diff --git a/packages/core/src/usenet/nntp/connection.ts b/packages/core/src/usenet/nntp/connection.ts
+index 5125e540..38e8c55f 100644
+--- a/packages/core/src/usenet/nntp/connection.ts
++++ b/packages/core/src/usenet/nntp/connection.ts
+@@ -17,6 +17,9 @@ import {
+ 
+ const logger = createLogger('usenet/connection');
+ 
++/** Guaranteed-missing id used for a no-payload reader capability probe. */
++const READER_PROBE_MESSAGE_ID = 'aiostreams-healthcheck@invalid';
++
+ export interface ConnectionOptions {
+   dialTimeoutMs: number;
+   idleConnectionMs: number;
+@@ -426,7 +429,16 @@ export class NntpConnection {
+     );
+   }
+ 
+-  /** DATE: cheap health check / keepalive. */
++  /**
++   * Verify that an authenticated connection can issue reader commands without
++   * downloading an article. STAT is a mandatory reader command; both 223
++   * (unexpectedly present) and 430/423 (missing) prove the connection is usable.
++   */
++  async probeReader(signal?: AbortSignal, timeoutMs = 15_000): Promise<void> {
++    await this.stat(READER_PROBE_MESSAGE_ID, signal, timeoutMs);
++  }
++
++  /** Return the server's current date when the optional DATE command is supported. */
+   async date(signal?: AbortSignal, timeoutMs = 15_000): Promise<void> {
+     const resp = await this.command('DATE', signal, timeoutMs);
+     const status = parseStatusLine(resp);
+diff --git a/packages/core/src/usenet/nntp/health-probe.test.ts b/packages/core/src/usenet/nntp/health-probe.test.ts
+new file mode 100644
+index 00000000..4fe01992
+--- /dev/null
++++ b/packages/core/src/usenet/nntp/health-probe.test.ts
+@@ -0,0 +1,254 @@
++import assert from 'node:assert/strict';
++import { once } from 'node:events';
++import net from 'node:net';
++import test from 'node:test';
++import { setTimeout as delay } from 'node:timers/promises';
++import { testUsenetProvider } from '../integration/dashboard/providers.js';
++import { CommandPriority, type ProviderConfig } from '../types.js';
++import { NntpConnection } from './connection.js';
++import {
++  ProviderWorkerPool,
++  type WorkerPoolOptions,
++} from './provider-worker-pool.js';
++
++const HEALTHCHECK_COMMAND = 'STAT <aiostreams-healthcheck@invalid>';
++
++interface FakeNntpServer {
++  port: number;
++  commands: string[];
++  activeSockets: Set<net.Socket>;
++  acceptedConnections: number;
++  close: () => Promise<void>;
++}
++
++type CommandHandler = (command: string, socket: net.Socket) => void;
++
++async function startFakeNntpServer(
++  onCommand: CommandHandler
++): Promise<FakeNntpServer> {
++  const commands: string[] = [];
++  const activeSockets = new Set<net.Socket>();
++  let acceptedConnections = 0;
++
++  const server = net.createServer((socket) => {
++    acceptedConnections++;
++    activeSockets.add(socket);
++    socket.once('close', () => activeSockets.delete(socket));
++    socket.setEncoding('utf8');
++
++    // Let the client finish its connect callback and install its greeting reader.
++    setImmediate(() => socket.write('201 fake nntp ready\r\n'));
++
++    let buffered = '';
++    socket.on('data', (chunk: string) => {
++      buffered += chunk;
++      for (;;) {
++        const end = buffered.indexOf('\r\n');
++        if (end === -1) break;
++        const command = buffered.slice(0, end);
++        buffered = buffered.slice(end + 2);
++        commands.push(command);
++        onCommand(command, socket);
++      }
++    });
++  });
++
++  server.listen(0, '127.0.0.1');
++  await once(server, 'listening');
++  const address = server.address();
++  assert(address && typeof address !== 'string');
++
++  return {
++    port: address.port,
++    commands,
++    activeSockets,
++    get acceptedConnections() {
++      return acceptedConnections;
++    },
++    close: async () => {
++      for (const socket of activeSockets) socket.destroy();
++      if (!server.listening) return;
++      await new Promise<void>((resolve) => server.close(() => resolve()));
++    },
++  };
++}
++
++function reply(socket: net.Socket, code: number, message: string): void {
++  socket.write(`${code} ${message}\r\n`);
++}
++
++function provider(
++  port: number,
++  overrides: Partial<ProviderConfig> = {}
++): ProviderConfig {
++  return {
++    id: 'fake',
++    host: '127.0.0.1',
++    port,
++    tls: false,
++    maxConnections: 1,
++    priority: 0,
++    ...overrides,
++  };
++}
++
++const CONNECTION_OPTIONS = {
++  dialTimeoutMs: 1_000,
++  idleConnectionMs: 1_000,
++};
++
++const WORKER_OPTIONS: WorkerPoolOptions = {
++  ...CONNECTION_OPTIONS,
++  circuitBreakerThreshold: 5,
++  circuitBreakerCooldownMs: 1_000,
++  pipelineDepth: 2,
++  streamingPriority: 1,
++};
++
++async function waitFor(
++  predicate: () => boolean,
++  description: string,
++  timeoutMs = 2_000
++): Promise<void> {
++  const deadline = Date.now() + timeoutMs;
++  while (Date.now() < deadline) {
++    if (predicate()) return;
++    await delay(10);
++  }
++  assert.fail(`timed out waiting for ${description}`);
++}
++
++function runKeepalive(pool: ProviderWorkerPool): void {
++  (pool as unknown as { keepalive: () => void }).keepalive();
++}
++
++function submitStat(pool: ProviderWorkerPool, messageId: string) {
++  return pool.submit<boolean>({
++    priority: CommandPriority.High,
++    run: async (conn) => ({
++      value: await conn.stat(messageId, undefined, 1_000),
++      bytes: 0,
++    }),
++  });
++}
++
++test('reader probe accepts a missing article and leaves the connection reusable', async () => {
++  const fake = await startFakeNntpServer((command, socket) => {
++    if (command.startsWith('STAT ')) reply(socket, 430, 'no such article');
++  });
++  let conn: NntpConnection | undefined;
++
++  try {
++    conn = await NntpConnection.connect(
++      provider(fake.port),
++      CONNECTION_OPTIONS
++    );
++    await conn.probeReader(undefined, 1_000);
++    assert.equal(
++      await conn.stat('second@test.invalid', undefined, 1_000),
++      false
++    );
++    assert.deepEqual(fake.commands.slice(0, 2), [
++      HEALTHCHECK_COMMAND,
++      'STAT <second@test.invalid>',
++    ]);
++    assert.equal(conn.isUsable, true);
++  } finally {
++    conn?.destroy();
++    await fake.close();
++  }
++});
++
++test('dashboard provider test uses the reader probe after authentication', async () => {
++  const fake = await startFakeNntpServer((command, socket) => {
++    if (command.startsWith('AUTHINFO USER '))
++      reply(socket, 381, 'password required');
++    else if (command.startsWith('AUTHINFO PASS '))
++      reply(socket, 281, 'authentication accepted');
++    else if (command.startsWith('STAT ')) reply(socket, 430, 'no such article');
++    else if (command === 'DATE') reply(socket, 400, 'DATE unavailable');
++  });
++
++  try {
++    const result = await testUsenetProvider({
++      ...provider(fake.port),
++      username: 'test-user',
++      password: 'test-password',
++    });
++
++    assert.equal(result.ok, true);
++    assert.equal(typeof result.latencyMs, 'number');
++    assert(fake.commands.includes(HEALTHCHECK_COMMAND));
++    assert.equal(fake.commands.includes('DATE'), false);
++  } finally {
++    await fake.close();
++  }
++});
++
++test('failed idle probe destroys the socket before the pool redials', async () => {
++  const fake = await startFakeNntpServer((command, socket) => {
++    if (command === HEALTHCHECK_COMMAND) reply(socket, 400, 'probe failed');
++    else if (command.startsWith('STAT ')) reply(socket, 430, 'no such article');
++    else if (command === 'DATE') reply(socket, 400, 'DATE unavailable');
++  });
++  const pool = new ProviderWorkerPool(provider(fake.port), WORKER_OPTIONS);
++
++  try {
++    await submitStat(pool, 'warmup@test.invalid');
++    assert.equal(fake.acceptedConnections, 1);
++    assert.equal(fake.activeSockets.size, 1);
++
++    runKeepalive(pool);
++    await waitFor(
++      () => fake.activeSockets.size === 0,
++      'failed probe socket close'
++    );
++    assert.equal(pool.info().total, 0);
++
++    await submitStat(pool, 'replacement@test.invalid');
++    assert.equal(fake.acceptedConnections, 2);
++    assert.equal(fake.activeSockets.size, 1);
++    assert.equal(pool.info().total, 1);
++  } finally {
++    pool.close();
++    await fake.close();
++  }
++});
++
++test('queued work waits for an idle probe instead of pipelining behind it', async () => {
++  let probeSocket: net.Socket | undefined;
++  const fake = await startFakeNntpServer((command, socket) => {
++    if (command === HEALTHCHECK_COMMAND) {
++      probeSocket = socket;
++      return;
++    }
++    if (command.startsWith('STAT ')) reply(socket, 430, 'no such article');
++  });
++  const pool = new ProviderWorkerPool(provider(fake.port), WORKER_OPTIONS);
++
++  try {
++    await submitStat(pool, 'warmup@test.invalid');
++    runKeepalive(pool);
++    await waitFor(() => probeSocket !== undefined, 'reader probe command');
++    assert.equal(
++      pool.freeSlots,
++      0,
++      "a reader probe reserves the slot's full pipeline capacity"
++    );
++
++    const queued = submitStat(pool, 'after-probe@test.invalid');
++    await delay(25);
++    assert.equal(
++      fake.commands.includes('STAT <after-probe@test.invalid>'),
++      false,
++      'real work was written while the idle probe still owned the slot'
++    );
++
++    reply(probeSocket!, 430, 'no such article');
++    assert.equal((await queued).value, false);
++    assert(fake.commands.includes('STAT <after-probe@test.invalid>'));
++  } finally {
++    pool.close();
++    await fake.close();
++  }
++});
+diff --git a/packages/core/src/usenet/nntp/provider-worker-pool.ts b/packages/core/src/usenet/nntp/provider-worker-pool.ts
+index 8900c55e..4b6c4841 100644
+--- a/packages/core/src/usenet/nntp/provider-worker-pool.ts
++++ b/packages/core/src/usenet/nntp/provider-worker-pool.ts
+@@ -56,13 +56,15 @@ interface Slot {
+   conn: NntpConnection | null;
+   /** A dial is in progress for this slot. */
+   connecting: boolean;
++  /** An idle reader probe owns this slot; real work must wait for it to settle. */
++  probing: boolean;
+   /** Consecutive failures on this slot's connection (per-connection breaker). */
+   failures: number;
+ }
+ 
+ /** Additive-increase step interval for the adaptive connection-limit throttle. */
+ const THROTTLE_STEP_MS = 5_000;
+-/** Keepalive DATE interval on otherwise-idle warm connections. */
++/** Reader-probe interval on otherwise-idle warm connections. */
+ const KEEPALIVE_MS = 30_000;
+ /** Backoff after a transient dial/connection failure before re-dialing. */
+ const DIAL_BACKOFF_MS = 1_000;
+@@ -129,6 +131,7 @@ export class ProviderWorkerPool {
+     this.slots = Array.from({ length: max }, () => ({
+       conn: null,
+       connecting: false,
++      probing: false,
+       failures: 0,
+     }));
+     this.state = config.enabled === false ? 'disabled' : 'online';
+@@ -161,7 +164,14 @@ export class ProviderWorkerPool {
+   /** Total pipeline slots free right now (used for least-busy provider ordering). */
+   get freeSlots(): number {
+     if (this.state !== 'online') return 0;
+-    return Math.max(0, this.allowed * this.depth - this.inFlightTotal());
++    const probeReservations = this.slots.reduce((total, slot) => {
++      if (!slot.probing) return total;
++      return total + Math.max(0, this.depth - (slot.conn?.inFlight ?? 0));
++    }, 0);
++    return Math.max(
++      0,
++      this.allowed * this.depth - this.inFlightTotal() - probeReservations
++    );
+   }
+ 
+   get inFlight(): number {
+@@ -328,7 +338,7 @@ export class ProviderWorkerPool {
+     // 1) Fill EXISTING usable connections' pipelines with compatible work first.
+     for (const slot of this.slots) {
+       if (!this.hasWork()) break;
+-      if (slot.connecting) continue;
++      if (slot.connecting || slot.probing) continue;
+       if (!slot.conn || !slot.conn.isUsable) {
+         slot.conn = null;
+         continue;
+@@ -358,7 +368,7 @@ export class ProviderWorkerPool {
+     }
+     for (const slot of this.slots) {
+       if (toDial <= 0) break;
+-      if (slot.connecting || slot.conn) continue;
++      if (slot.connecting || slot.probing || slot.conn) continue;
+       this.beginDial(slot);
+       toDial--;
+     }
+@@ -449,7 +459,7 @@ export class ProviderWorkerPool {
+         slot.failures = 0;
+         // Refresh staleness on real work so purge only reaps genuinely idle
+         // connections (touch-at-connect-only redialed active streams every
+-        // stale interval). Keepalive DATEs deliberately don't touch.
++        // stale interval). Idle reader probes deliberately don't touch.
+         conn.touch();
+         this.recordServiceTime(durationMs);
+         if (res.bytes > 0) this.recordThroughput(res.bytes, durationMs);
+@@ -574,19 +584,29 @@ export class ProviderWorkerPool {
+     for (const req of all) req.reject(err);
+   }
+ 
+-  /** Periodic DATE on idle warm connections so the server doesn't reap them. */
++  /** Periodic no-payload reader probe on idle warm connections. */
+   private keepalive(): void {
+     if (this.closed) return;
+     if (this.hasWork()) this.dispatch();
+     for (const slot of this.slots) {
+       const conn = slot.conn;
+-      if (!conn || !conn.isUsable || conn.inFlight > 0) continue;
++      if (!conn || slot.probing || !conn.isUsable || conn.inFlight > 0)
++        continue;
++      slot.probing = true;
+       conn
+-        .date(undefined, this.opts.idleConnectionMs)
++        .probeReader(undefined, this.opts.idleConnectionMs)
+         .catch(() => {
+-          if (slot.conn === conn) slot.conn = null;
++          if (slot.conn === conn) {
++            // A failed probe leaves transport/protocol state uncertain. Close it
++            // explicitly before releasing the slot so the socket cannot leak.
++            conn.destroy();
++            slot.conn = null;
++          }
+         })
+-        .finally(() => this.dispatch());
++        .finally(() => {
++          slot.probing = false;
++          this.dispatch();
++        });
+     }
+   }
+ 
+diff --git a/packages/server/src/routes/api/dashboard/usenet.ts b/packages/server/src/routes/api/dashboard/usenet.ts
+index a4ba00c1..07417262 100644
+--- a/packages/server/src/routes/api/dashboard/usenet.ts
++++ b/packages/server/src/routes/api/dashboard/usenet.ts
+@@ -217,7 +217,7 @@ router.patch('/settings', async (req, res, next) => {
+   }
+ });
+ 
+-// POST /dashboard/usenet/providers/test — dial + auth + DATE probe.
++// POST /dashboard/usenet/providers/test — dial + auth + reader probe.
+ router.post('/providers/test', async (req, res, next) => {
+   try {
+     const result = await testUsenetProvider(

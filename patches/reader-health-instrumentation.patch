@@ -1,0 +1,91 @@
+diff --git a/packages/core/src/usenet/integration/dashboard/stats.ts b/packages/core/src/usenet/integration/dashboard/stats.ts
+index 97e18237..32faa3d8 100644
+--- a/packages/core/src/usenet/integration/dashboard/stats.ts
++++ b/packages/core/src/usenet/integration/dashboard/stats.ts
+@@ -244,6 +244,13 @@ function idlePool(
+       freeSlots: 0,
+       throughput: 0,
+       queued: 0,
++      readerHealth: {
++        attempts: 0,
++        successes: 0,
++        failures: 0,
++        lastSuccessAt: undefined,
++        dialErrors: 0,
++      },
+     })),
+     globalDownloadsInUse: 0,
+     globalDownloadMax: options.maxConcurrentDownloads ?? 0,
+diff --git a/packages/core/src/usenet/nntp/provider-worker-pool.ts b/packages/core/src/usenet/nntp/provider-worker-pool.ts
+index 4b6c4841..07e5d797 100644
+--- a/packages/core/src/usenet/nntp/provider-worker-pool.ts
++++ b/packages/core/src/usenet/nntp/provider-worker-pool.ts
+@@ -98,6 +98,11 @@ export class ProviderWorkerPool {
+ 
+   private lastDialOkAt = 0;
+   private lastDialError?: { at: number; kind: string; message: string };
++  private dialErrorCount = 0;
++  private readerProbeAttempts = 0;
++  private readerProbeSuccesses = 0;
++  private readerProbeFailures = 0;
++  private lastReaderProbeSuccessAt = 0;
+ 
+   /** A successful authenticated dial has happened at least once. */
+   private everOnline = false;
+@@ -404,6 +409,7 @@ export class ProviderWorkerPool {
+   }
+ 
+   private onDialError(slot: Slot, err: unknown): void {
++    this.dialErrorCount++;
+     this.lastDialError = {
+       at: Date.now(),
+       kind: err instanceof NntpError ? err.kind : 'unknown',
+@@ -593,9 +599,15 @@ export class ProviderWorkerPool {
+       if (!conn || slot.probing || !conn.isUsable || conn.inFlight > 0)
+         continue;
+       slot.probing = true;
++      this.readerProbeAttempts++;
+       conn
+         .probeReader(undefined, this.opts.idleConnectionMs)
++        .then(() => {
++          this.readerProbeSuccesses++;
++          this.lastReaderProbeSuccessAt = Date.now();
++        })
+         .catch(() => {
++          this.readerProbeFailures++;
+           if (slot.conn === conn) {
+             // A failed probe leaves transport/protocol state uncertain. Close it
+             // explicitly before releasing the slot so the socket cannot leak.
+@@ -648,6 +660,13 @@ export class ProviderWorkerPool {
+       queued: this.prioQ.length + this.normalQ.length,
+       lastDialOkAt: this.lastDialOkAt || undefined,
+       lastDialError: this.lastDialError,
++      readerHealth: {
++        attempts: this.readerProbeAttempts,
++        successes: this.readerProbeSuccesses,
++        failures: this.readerProbeFailures,
++        lastSuccessAt: this.lastReaderProbeSuccessAt || undefined,
++        dialErrors: this.dialErrorCount,
++      },
+     };
+   }
+ 
+diff --git a/packages/core/src/usenet/types.ts b/packages/core/src/usenet/types.ts
+index 7def484b..0013d5ab 100644
+--- a/packages/core/src/usenet/types.ts
++++ b/packages/core/src/usenet/types.ts
+@@ -191,6 +191,14 @@ export interface ProviderPoolInfo {
+   queued: number;
+   lastDialOkAt?: number;
+   lastDialError?: { at: number; kind: string; message: string };
++  /** Sanitized monotonic reader-health observations for rollout canaries. */
++  readerHealth: {
++    attempts: number;
++    successes: number;
++    failures: number;
++    lastSuccessAt?: number;
++    dialErrors: number;
++  };
+ }
+ 
+ export interface PoolInfo {

@@ -1,0 +1,257 @@
+name: Build patched AIOStreams image
+
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: 'Frozen deployment lane'
+        required: true
+        type: choice
+        options: [stable, nightly]
+      base_sha:
+        description: 'Exact upstream base commit'
+        required: true
+        type: string
+      official_digest:
+        description: 'Exact official rollback digest (sha256:...)'
+        required: true
+        type: string
+      pr_head:
+        description: 'Exact reviewed PR head commit'
+        required: true
+        type: string
+      instrumentation_commit:
+        description: 'Exact reviewed instrumentation commit'
+        required: true
+        type: string
+      tag_suffix:
+        description: 'Immutable image tag suffix'
+        required: true
+        type: string
+      approval_artifact_digest:
+        description: 'Change Review approval artifact digest'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: https://github.com/Viren070/AIOStreams.git
+  FORK_REPO: https://github.com/git-geeky/AIOStreams.git
+  PATCH_INVENTORY: >-
+    packages/core/src/usenet/integration/dashboard/providers.ts
+    packages/core/src/usenet/nntp/connection.ts
+    packages/core/src/usenet/nntp/health-probe.test.ts
+    packages/core/src/usenet/nntp/provider-worker-pool.ts
+    packages/server/src/routes/api/dashboard/usenet.ts
+  INSTRUMENTATION_INVENTORY: >-
+    packages/core/src/usenet/integration/dashboard/stats.ts
+    packages/core/src/usenet/nntp/provider-worker-pool.ts
+    packages/core/src/usenet/types.ts
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      artifact_name: ${{ steps.meta.outputs.artifact_name }}
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate workflow inputs
+        shell: bash
+        env:
+          LANE: ${{ inputs.lane }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          OFFICIAL_DIGEST: ${{ inputs.official_digest }}
+          PR_HEAD: ${{ inputs.pr_head }}
+          INSTRUMENTATION_COMMIT: ${{ inputs.instrumentation_commit }}
+          TAG_SUFFIX: ${{ inputs.tag_suffix }}
+          APPROVAL_DIGEST: ${{ inputs.approval_artifact_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$LANE" == stable || "$LANE" == nightly ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$INSTRUMENTATION_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$OFFICIAL_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$APPROVAL_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$TAG_SUFFIX" =~ ^[A-Za-z0-9._-]{8,96}$ ]]
+
+      - name: Prepare exact source tuple
+        shell: bash
+        env:
+          LANE: ${{ inputs.lane }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          PR_HEAD: ${{ inputs.pr_head }}
+          INSTRUMENTATION_COMMIT: ${{ inputs.instrumentation_commit }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none "$UPSTREAM_REPO" source
+          cd source
+          git fetch --no-tags origin "$BASE_SHA"
+          git fetch --no-tags "$FORK_REPO" "$PR_HEAD"
+          git checkout --detach "$BASE_SHA"
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          git diff --name-only "$BASE_SHA..$PR_HEAD" -- $PATCH_INVENTORY > /tmp/pr-files
+          test "$(wc -l < /tmp/pr-files)" -eq 5
+          diff -u <(printf '%s\n' $PATCH_INVENTORY) /tmp/pr-files
+          git diff --binary "$BASE_SHA..$PR_HEAD" -- $PATCH_INVENTORY > /tmp/reader-health.patch
+          git apply --3way --index /tmp/reader-health.patch
+          git diff --cached --name-only | diff -u <(printf '%s\n' $PATCH_INVENTORY) -
+          git commit -m "build: apply reviewed reader-health patch"
+          git apply --3way --index ../patches/reader-health-instrumentation.patch
+          git diff --cached --name-only | grep -Fxq packages/core/src/usenet/integration/dashboard/stats.ts
+          git diff --cached --name-only | grep -Fxq packages/core/src/usenet/nntp/provider-worker-pool.ts
+          git diff --cached --name-only | grep -Fxq packages/core/src/usenet/types.ts
+          git commit -m "build: add sanitized reader-health instrumentation"
+          test "$(git rev-parse HEAD)" != "$BASE_SHA"
+          git tag -a "patched-$LANE-${GITHUB_RUN_ID}" -m "patched $LANE source tuple"
+          echo "SYNTHETIC_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SYNTHETIC_TREE=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
+          echo "PATCH_DIGEST=$(sha256sum /tmp/reader-health.patch | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "INSTRUMENTATION_DIGEST=$(sha256sum ../patches/reader-health-instrumentation.patch | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Install, format-check, test, and build
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm exec prettier --check \
+            packages/core/src/usenet/integration/dashboard/providers.ts \
+            packages/core/src/usenet/integration/dashboard/stats.ts \
+            packages/core/src/usenet/nntp/connection.ts \
+            packages/core/src/usenet/nntp/health-probe.test.ts \
+            packages/core/src/usenet/nntp/provider-worker-pool.ts \
+            packages/core/src/usenet/types.ts \
+            packages/server/src/routes/api/dashboard/usenet.ts
+          pnpm -F @aiostreams/core run build
+          pnpm -F @aiostreams/core test -- --test-name-pattern='reader|provider|probe'
+          pnpm run build
+          node scripts/generateMetadata.cjs --channel="${{ inputs.lane }}"
+
+      - name: Build amd64 image without registry credentials
+        working-directory: source
+        env:
+          LANE: ${{ inputs.lane }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          OFFICIAL_DIGEST: ${{ inputs.official_digest }}
+          PR_HEAD: ${{ inputs.pr_head }}
+          APPROVAL_DIGEST: ${{ inputs.approval_artifact_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx create --use --name patched-builder 2>/dev/null || docker buildx use patched-builder
+          docker buildx build --platform linux/amd64 --load \
+            --tag "local/aiostreams:${{ inputs.lane }}-${GITHUB_RUN_ID}" \
+            --label "org.opencontainers.image.revision=$SYNTHETIC_COMMIT" \
+            --label "org.opencontainers.image.source=https://github.com/git-geeky/aiostreams-patched-nightly" \
+            --label "org.opencontainers.image.description=temporary PR1206 reader-health patch" \
+            --label "io.aiostreams.lane=${{ inputs.lane }}" \
+            --label "io.aiostreams.upstream-base=${{ inputs.base_sha }}" \
+            --label "io.aiostreams.pr-head=${{ inputs.pr_head }}" \
+            --label "io.aiostreams.instrumentation-commit=${{ inputs.instrumentation_commit }}" \
+            --label "io.aiostreams.official-rollback=${{ inputs.official_digest }}" \
+            --label "io.aiostreams.approval-artifact=${{ inputs.approval_artifact_digest }}" \
+            .
+          docker save "local/aiostreams:${{ inputs.lane }}-${GITHUB_RUN_ID}" -o /tmp/aiostreams.tar
+          docker image inspect "local/aiostreams:${{ inputs.lane }}-${GITHUB_RUN_ID}" > /tmp/image-inspect.json
+          docker history --no-trunc --format '{{.Size}}' "local/aiostreams:${{ inputs.lane }}-${GITHUB_RUN_ID}" > /tmp/layer-sizes.txt
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          inspect = json.loads(pathlib.Path('/tmp/image-inspect.json').read_text())[0]
+          sizes = []
+          for raw in pathlib.Path('/tmp/layer-sizes.txt').read_text().splitlines():
+              raw = raw.strip()
+              if raw in ('', '0B', '0B '): continue
+              m = re.fullmatch(r'([0-9.]+)(B|kB|MB|GB)', raw)
+              if not m: raise SystemExit(f'unparseable layer size: {raw}')
+              scale = {'B':1,'kB':1000,'MB':1000**2,'GB':1000**3}[m.group(2)]
+              sizes.append(int(float(m.group(1))*scale))
+          if not sizes: raise SystemExit('missing uncompressed layer bounds')
+          payload = {
+              'version': 1, 'platform': 'linux/amd64', 'lane': os.environ['LANE'],
+              'syntheticCommit': os.environ['SYNTHETIC_COMMIT'],
+              'syntheticTree': os.environ['SYNTHETIC_TREE'],
+              'patchDigest': os.environ['PATCH_DIGEST'],
+              'instrumentationDigest': os.environ['INSTRUMENTATION_DIGEST'],
+              'baseSha': os.environ['BASE_SHA'], 'prHead': os.environ['PR_HEAD'],
+              'officialRollbackDigest': os.environ['OFFICIAL_DIGEST'],
+              'approvalArtifactDigest': os.environ['APPROVAL_DIGEST'],
+              'missingCompressedBytes': pathlib.Path('/tmp/aiostreams.tar').stat().st_size,
+              'missingUncompressedUpperBound': sum(sizes),
+              'layerUncompressedUpperBounds': sizes,
+              'rootfsLayers': inspect.get('RootFS', {}).get('Layers', []),
+          }
+          pathlib.Path('/tmp/provenance.json').write_text(json.dumps(payload, sort_keys=True, separators=(',', ':'))+'\n')
+          PY
+
+      - name: Upload image and provenance artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: patched-${{ inputs.lane }}-${{ github.run_id }}
+          path: |
+            /tmp/aiostreams.tar
+            /tmp/image-inspect.json
+            /tmp/layer-sizes.txt
+            /tmp/provenance.json
+          retention-days: 7
+
+      - name: Upload source receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-${{ inputs.lane }}-${{ github.run_id }}
+          path: source/.git/refs/tags/patched-${{ inputs.lane }}-${{ github.run_id }}
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: patched-${{ inputs.lane }}-${{ github.run_id }}
+          path: /tmp/patched
+
+      - name: Load and push immutable image
+        id: push
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_TAG: ghcr.io/git-geeky/aiostreams-patched-nightly:${{ inputs.tag_suffix }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u git-geeky --password-stdin
+          docker load -i /tmp/patched/aiostreams.tar
+          local_id=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep '^local/aiostreams:' | head -1)
+          test -n "$local_id"
+          docker tag "$local_id" "$IMAGE_TAG"
+          digest=$(docker push "$IMAGE_TAG" | tee /tmp/push.txt | sed -n 's/^digest: //p' | tail -1)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          cp /tmp/patched/provenance.json /tmp/provenance-published.json
+          jq --arg ref "$IMAGE_TAG" --arg digest "$digest" '. + {imageReference:$ref,imageDigest:$digest}' /tmp/provenance-published.json > /tmp/provenance-final.json
+
+      - name: Attest pushed image
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-name: ghcr.io/git-geeky/aiostreams-patched-nightly
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Upload published receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: published-${{ inputs.lane }}-${{ github.run_id }}
+          path: /tmp/provenance-final.json
+          retention-days: 30

@@ -246,7 +246,8 @@ jobs:
           local_id=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep '^local/aiostreams:' | head -1)
           test -n "$local_id"
           docker tag "$local_id" "$IMAGE_TAG"
-          digest=$(docker push "$IMAGE_TAG" | tee /tmp/push.txt | sed -n 's/^digest: //p' | tail -1)
+          docker push "$IMAGE_TAG" | tee /tmp/push.txt
+          digest=$(grep -oE 'sha256:[0-9a-f]{64}' /tmp/push.txt | tail -1)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           cp /tmp/patched/provenance.json /tmp/provenance-published.json

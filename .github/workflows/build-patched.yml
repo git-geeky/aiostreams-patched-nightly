@@ -94,6 +94,8 @@ jobs:
           git fetch --no-tags origin "$BASE_SHA"
           git fetch --no-tags "$FORK_REPO" "$PR_HEAD"
           git checkout --detach "$BASE_SHA"
+          git config user.name "git-geeky patched builder"
+          git config user.email "git-geeky@users.noreply.github.com"
           test "$(git rev-parse HEAD)" = "$BASE_SHA"
           git diff --name-only "$BASE_SHA..$PR_HEAD" -- $PATCH_INVENTORY > /tmp/pr-files
           test "$(wc -l < /tmp/pr-files)" -eq 5

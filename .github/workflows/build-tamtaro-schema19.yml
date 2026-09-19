@@ -120,9 +120,16 @@ jobs:
           test -s /tmp/schema19-adaptation.patch
           ! grep -q '^packages/core/src/db/migrations/' /tmp/source-files.txt
 
+          source_tag="tamtaro-schema19-${LANE}-${GITHUB_RUN_ID}"
+          git config user.name 'git-geeky compatibility builder'
+          git config user.email 'git-geeky@users.noreply.github.com'
+          git tag -a "$source_tag" -m "Tamtaro 3.2.6 schema-19 compatibility source"
+          test "$(git describe --tags --abbrev=0)" = "$source_tag"
+
           echo "FOLDER_PATCH_DIGEST=$(sha256sum /tmp/folder-size.patch | awk '{print $1}')" >> "$GITHUB_ENV"
           echo "HEALTH_PATCH_DIGEST=$(sha256sum /tmp/health-checks.patch | awk '{print $1}')" >> "$GITHUB_ENV"
           echo "ADAPTATION_PATCH_DIGEST=$(sha256sum /tmp/schema19-adaptation.patch | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "SOURCE_TAG=$source_tag" >> "$GITHUB_ENV"
 
       - name: Set up Node 24
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -180,6 +187,7 @@ jobs:
             --label "io.aiostreams.health-checks-commit=$HEALTH_COMMIT" \
             --label "io.aiostreams.compat-adaptation=$SOURCE_COMMIT" \
             --label "io.aiostreams.source-tree=$SOURCE_TREE" \
+            --label "io.aiostreams.source-tag=$SOURCE_TAG" \
             --label "io.aiostreams.rollback-digest=$ROLLBACK_DIGEST" \
             --label "io.aiostreams.approval-artifact=$APPROVAL_DIGEST" \
             .
@@ -210,6 +218,7 @@ jobs:
               'healthCommit': os.environ['HEALTH_COMMIT'],
               'sourceCommit': os.environ['SOURCE_COMMIT'],
               'sourceTree': os.environ['SOURCE_TREE'],
+              'sourceTag': os.environ['SOURCE_TAG'],
               'folderPatchDigest': os.environ['FOLDER_PATCH_DIGEST'],
               'healthPatchDigest': os.environ['HEALTH_PATCH_DIGEST'],
               'adaptationPatchDigest': os.environ['ADAPTATION_PATCH_DIGEST'],

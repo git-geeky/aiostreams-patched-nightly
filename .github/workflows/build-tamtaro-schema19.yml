@@ -1,0 +1,301 @@
+name: Build Tamtaro schema-19 compatibility image
+
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: 'Frozen deployment lane'
+        required: true
+        type: choice
+        options: [stable, nightly]
+      source_base_sha:
+        description: 'Exact currently reviewed schema-19 source base'
+        required: true
+        type: string
+      folder_commit:
+        description: 'Exact folderSize backport commit'
+        required: true
+        type: string
+      health_commit:
+        description: 'Exact health-check backport commit'
+        required: true
+        type: string
+      source_commit:
+        description: 'Exact final compatibility source commit'
+        required: true
+        type: string
+      source_tree:
+        description: 'Exact final compatibility source tree'
+        required: true
+        type: string
+      rollback_digest:
+        description: 'Exact currently deployed rollback digest (sha256:...)'
+        required: true
+        type: string
+      tag_suffix:
+        description: 'Immutable image tag suffix'
+        required: true
+        type: string
+      approval_artifact_digest:
+        description: 'Immutable deployment approval artifact digest'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORK_REPO: https://github.com/git-geeky/AIOStreams.git
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.meta.outputs.artifact_name }}
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate immutable inputs
+        shell: bash
+        env:
+          LANE: ${{ inputs.lane }}
+          SOURCE_BASE_SHA: ${{ inputs.source_base_sha }}
+          FOLDER_COMMIT: ${{ inputs.folder_commit }}
+          HEALTH_COMMIT: ${{ inputs.health_commit }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_TREE: ${{ inputs.source_tree }}
+          ROLLBACK_DIGEST: ${{ inputs.rollback_digest }}
+          TAG_SUFFIX: ${{ inputs.tag_suffix }}
+          APPROVAL_DIGEST: ${{ inputs.approval_artifact_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$LANE" == stable || "$LANE" == nightly ]]
+          [[ "$SOURCE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$FOLDER_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEALTH_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ROLLBACK_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$APPROVAL_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$TAG_SUFFIX" =~ ^[A-Za-z0-9._-]{8,96}$ ]]
+
+      - name: Verify and prepare exact schema-19 source
+        shell: bash
+        env:
+          LANE: ${{ inputs.lane }}
+          SOURCE_BASE_SHA: ${{ inputs.source_base_sha }}
+          FOLDER_COMMIT: ${{ inputs.folder_commit }}
+          HEALTH_COMMIT: ${{ inputs.health_commit }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_TREE: ${{ inputs.source_tree }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout "$FORK_REPO" source
+          cd source
+          git fetch --no-tags origin "$SOURCE_BASE_SHA"
+          git fetch --no-tags origin "$FOLDER_COMMIT"
+          git fetch --no-tags origin "$HEALTH_COMMIT"
+          git fetch --no-tags origin "$SOURCE_COMMIT"
+
+          test "$(git rev-parse "$FOLDER_COMMIT^")" = "$SOURCE_BASE_SHA"
+          test "$(git rev-parse "$HEALTH_COMMIT^")" = "$FOLDER_COMMIT"
+          test "$(git rev-parse "$SOURCE_COMMIT^")" = "$HEALTH_COMMIT"
+
+          git checkout --detach "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          test "$(node -p "require('./package.json').version")" = '2.33.2'
+
+          git diff --quiet "$SOURCE_BASE_SHA..$SOURCE_COMMIT" -- packages/core/src/db/migrations
+          max_migration=$(find packages/core/src/db/migrations -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]_*.ts' -printf '%f\n' | sort | tail -1 | cut -c1-4)
+          test "$max_migration" = '0019'
+
+          git diff --binary "$SOURCE_BASE_SHA..$FOLDER_COMMIT" > /tmp/folder-size.patch
+          git diff --binary "$FOLDER_COMMIT..$HEALTH_COMMIT" > /tmp/health-checks.patch
+          git diff --binary "$HEALTH_COMMIT..$SOURCE_COMMIT" > /tmp/schema19-adaptation.patch
+          git diff --name-only "$SOURCE_BASE_SHA..$SOURCE_COMMIT" > /tmp/source-files.txt
+          test -s /tmp/folder-size.patch
+          test -s /tmp/health-checks.patch
+          test -s /tmp/schema19-adaptation.patch
+          ! grep -q '^packages/core/src/db/migrations/' /tmp/source-files.txt
+
+          echo "FOLDER_PATCH_DIGEST=$(sha256sum /tmp/folder-size.patch | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "HEALTH_PATCH_DIGEST=$(sha256sum /tmp/health-checks.patch | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "ADAPTATION_PATCH_DIGEST=$(sha256sum /tmp/schema19-adaptation.patch | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Set up Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Install, validate, test, and build
+        working-directory: source
+        shell: bash
+        env:
+          SOURCE_BASE_SHA: ${{ inputs.source_base_sha }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile
+          mapfile -t changed_typescript < <(git diff --name-only "$SOURCE_BASE_SHA..$SOURCE_COMMIT" -- '*.ts' '*.tsx')
+          test "${#changed_typescript[@]}" -gt 0
+          pnpm exec prettier --check "${changed_typescript[@]}"
+          grep -Fq 'this.parser.functions.folderSize' packages/core/src/parser/streamExpression.ts
+          grep -Fq 'isUnsafeRemoteUrlResolved' packages/core/src/variants/health-checks.ts
+          pnpm -F @aiostreams/core run build
+          pnpm -F @aiostreams/core test
+          pnpm run build
+          node scripts/generateMetadata.cjs --channel="${{ inputs.lane }}"
+
+      - name: Build amd64 image without registry credentials
+        working-directory: source
+        shell: bash
+        env:
+          LANE: ${{ inputs.lane }}
+          SOURCE_BASE_SHA: ${{ inputs.source_base_sha }}
+          FOLDER_COMMIT: ${{ inputs.folder_commit }}
+          HEALTH_COMMIT: ${{ inputs.health_commit }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_TREE: ${{ inputs.source_tree }}
+          ROLLBACK_DIGEST: ${{ inputs.rollback_digest }}
+          APPROVAL_DIGEST: ${{ inputs.approval_artifact_digest }}
+        run: |
+          set -euo pipefail
+          docker buildx create --use --name tamtaro-schema19-builder 2>/dev/null || docker buildx use tamtaro-schema19-builder
+          docker buildx build --platform linux/amd64 --load \
+            --tag "local/aiostreams:${LANE}-${GITHUB_RUN_ID}" \
+            --label "org.opencontainers.image.revision=$SOURCE_COMMIT" \
+            --label "org.opencontainers.image.source=https://github.com/git-geeky/AIOStreams" \
+            --label "org.opencontainers.image.description=Tamtaro 3.2.6 compatibility backport on AIOStreams 2.33.2 schema 19" \
+            --label "io.aiostreams.lane=$LANE" \
+            --label "io.aiostreams.compatibility=tamtaro-complete-3.2.6" \
+            --label "io.aiostreams.schema-ceiling=19" \
+            --label "io.aiostreams.source-base=$SOURCE_BASE_SHA" \
+            --label "io.aiostreams.folder-size-commit=$FOLDER_COMMIT" \
+            --label "io.aiostreams.health-checks-commit=$HEALTH_COMMIT" \
+            --label "io.aiostreams.compat-adaptation=$SOURCE_COMMIT" \
+            --label "io.aiostreams.source-tree=$SOURCE_TREE" \
+            --label "io.aiostreams.rollback-digest=$ROLLBACK_DIGEST" \
+            --label "io.aiostreams.approval-artifact=$APPROVAL_DIGEST" \
+            .
+
+          docker save "local/aiostreams:${LANE}-${GITHUB_RUN_ID}" -o /tmp/aiostreams.tar
+          docker image inspect "local/aiostreams:${LANE}-${GITHUB_RUN_ID}" > /tmp/image-inspect.json
+          docker history --no-trunc --format '{{.Size}}' "local/aiostreams:${LANE}-${GITHUB_RUN_ID}" > /tmp/layer-sizes.txt
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          inspect = json.loads(pathlib.Path('/tmp/image-inspect.json').read_text())[0]
+          sizes = []
+          for raw in pathlib.Path('/tmp/layer-sizes.txt').read_text().splitlines():
+              raw = raw.strip()
+              if raw in ('', '0B'): continue
+              match = re.fullmatch(r'([0-9.]+)(B|kB|MB|GB)', raw)
+              if not match: raise SystemExit(f'unparseable layer size: {raw}')
+              scale = {'B':1, 'kB':1000, 'MB':1000**2, 'GB':1000**3}[match.group(2)]
+              sizes.append(int(float(match.group(1)) * scale))
+          if not sizes: raise SystemExit('missing uncompressed layer bounds')
+          payload = {
+              'version': 3,
+              'platform': 'linux/amd64',
+              'lane': os.environ['LANE'],
+              'compatibility': 'tamtaro-complete-3.2.6',
+              'schemaCeiling': 19,
+              'sourceBaseSha': os.environ['SOURCE_BASE_SHA'],
+              'folderCommit': os.environ['FOLDER_COMMIT'],
+              'healthCommit': os.environ['HEALTH_COMMIT'],
+              'sourceCommit': os.environ['SOURCE_COMMIT'],
+              'sourceTree': os.environ['SOURCE_TREE'],
+              'folderPatchDigest': os.environ['FOLDER_PATCH_DIGEST'],
+              'healthPatchDigest': os.environ['HEALTH_PATCH_DIGEST'],
+              'adaptationPatchDigest': os.environ['ADAPTATION_PATCH_DIGEST'],
+              'rollbackDigest': os.environ['ROLLBACK_DIGEST'],
+              'approvalArtifactDigest': os.environ['APPROVAL_DIGEST'],
+              'missingCompressedBytes': pathlib.Path('/tmp/aiostreams.tar').stat().st_size,
+              'missingUncompressedUpperBound': sum(sizes),
+              'layerUncompressedUpperBounds': sizes,
+              'rootfsLayers': inspect.get('RootFS', {}).get('Layers', []),
+          }
+          pathlib.Path('/tmp/provenance.json').write_text(json.dumps(payload, sort_keys=True, separators=(',', ':')) + '\n')
+          PY
+
+      - name: Set artifact name
+        id: meta
+        shell: bash
+        run: echo "artifact_name=tamtaro-schema19-${{ inputs.lane }}-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload image and provenance artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tamtaro-schema19-${{ inputs.lane }}-${{ github.run_id }}
+          path: |
+            /tmp/aiostreams.tar
+            /tmp/image-inspect.json
+            /tmp/layer-sizes.txt
+            /tmp/provenance.json
+            /tmp/source-files.txt
+            /tmp/folder-size.patch
+            /tmp/health-checks.patch
+            /tmp/schema19-adaptation.patch
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: /tmp/built
+
+      - name: Load and push immutable image
+        id: push
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_TAG: ghcr.io/git-geeky/aiostreams-patched-nightly:${{ inputs.tag_suffix }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u git-geeky --password-stdin
+          docker load -i /tmp/built/aiostreams.tar
+          local_id=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep '^local/aiostreams:' | head -1)
+          test -n "$local_id"
+          docker tag "$local_id" "$IMAGE_TAG"
+          docker push "$IMAGE_TAG" | tee /tmp/push.txt
+          digest=$(grep -oE 'sha256:[0-9a-f]{64}' /tmp/push.txt | tail -1)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          jq --arg ref "$IMAGE_TAG" --arg digest "$digest" '. + {imageReference:$ref,imageDigest:$digest}' /tmp/built/provenance.json > /tmp/provenance-final.json
+
+      - name: Attest pushed image
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-name: ghcr.io/git-geeky/aiostreams-patched-nightly
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest exact compatibility source tuple
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-name: ghcr.io/git-geeky/aiostreams-patched-nightly
+          subject-digest: ${{ steps.push.outputs.digest }}
+          predicate-type: https://github.com/git-geeky/aiostreams-patched-nightly/attestation/v1
+          predicate-path: /tmp/provenance-final.json
+          push-to-registry: true
+
+      - name: Upload published receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: published-tamtaro-schema19-${{ inputs.lane }}-${{ github.run_id }}
+          path: /tmp/provenance-final.json
+          retention-days: 30

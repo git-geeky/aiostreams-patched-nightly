@@ -17,3 +17,11 @@ versioned provenance receipt plus registry attestations.
 The production controller accepts only a digest and a matching provenance
 tuple. The `nightly` and `stable` lanes are built separately from their frozen
 source bases so a stable build never silently imports unrelated nightly commits.
+
+`build-tamtaro-schema19.yml` is a separate, bounded compatibility workflow. It
+builds an exact public source commit that backports Tamtaro Complete 3.2.6's
+`folderSize()` and health-check requirements onto the reviewed AIOStreams 2.33.2
+schema-19 line. It verifies a direct commit chain, exact source tree, unchanged
+migration directory, maximum migration 0019, formatting, tests, and the full
+monorepo build before publishing. Its lane-specific rollback digest and approval
+artifact digest are embedded in both image labels and the attested provenance.

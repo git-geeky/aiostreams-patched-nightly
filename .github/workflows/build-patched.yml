@@ -21,7 +21,11 @@ on:
         required: true
         type: string
       pr_head:
-        description: 'Exact reviewed PR head commit'
+        description: 'Exact reviewed upstream PR head commit'
+        required: true
+        type: string
+      patch_commit:
+        description: 'Exact base-specific reviewed patch transplant commit'
         required: true
         type: string
       overlay_commit:
@@ -33,7 +37,7 @@ on:
         required: true
         type: string
       approval_artifact_digest:
-        description: 'Change Review approval artifact digest'
+        description: 'Immutable deployment approval artifact digest'
         required: true
         type: string
 
@@ -43,7 +47,14 @@ permissions:
 env:
   UPSTREAM_REPO: https://github.com/Viren070/AIOStreams.git
   FORK_REPO: https://github.com/git-geeky/AIOStreams.git
+  UPSTREAM_PATCH_INVENTORY: >-
+    packages/core/src/usenet/integration/dashboard/providers.ts
+    packages/core/src/usenet/nntp/connection.ts
+    packages/core/src/usenet/nntp/health-probe.test.ts
+    packages/core/src/usenet/nntp/provider-worker-pool.ts
+    packages/server/src/routes/api/dashboard/usenet.ts
   PATCH_INVENTORY: >-
+    packages/core/src/usenet/integration/dashboard/provider-health.ts
     packages/core/src/usenet/integration/dashboard/providers.ts
     packages/core/src/usenet/nntp/connection.ts
     packages/core/src/usenet/nntp/health-probe.test.ts
@@ -74,6 +85,7 @@ jobs:
           PATCH_BASE_SHA: ${{ inputs.patch_base_sha }}
           OFFICIAL_DIGEST: ${{ inputs.official_digest }}
           PR_HEAD: ${{ inputs.pr_head }}
+          PATCH_COMMIT: ${{ inputs.patch_commit }}
           OVERLAY_COMMIT: ${{ inputs.overlay_commit }}
           TAG_SUFFIX: ${{ inputs.tag_suffix }}
           APPROVAL_DIGEST: ${{ inputs.approval_artifact_digest }}
@@ -83,6 +95,7 @@ jobs:
           [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$PATCH_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$PR_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PATCH_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$OVERLAY_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$OFFICIAL_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$APPROVAL_DIGEST" =~ ^[0-9a-f]{64}$ ]]
@@ -95,6 +108,7 @@ jobs:
           BASE_SHA: ${{ inputs.base_sha }}
           PATCH_BASE_SHA: ${{ inputs.patch_base_sha }}
           PR_HEAD: ${{ inputs.pr_head }}
+          PATCH_COMMIT: ${{ inputs.patch_commit }}
           OVERLAY_COMMIT: ${{ inputs.overlay_commit }}
         run: |
           set -euo pipefail
@@ -103,6 +117,7 @@ jobs:
           git fetch --no-tags origin "$BASE_SHA"
           git fetch --no-tags origin "$PATCH_BASE_SHA"
           git fetch --no-tags "$FORK_REPO" "$PR_HEAD"
+          git fetch --no-tags "$FORK_REPO" "$PATCH_COMMIT"
           git fetch --no-tags "$FORK_REPO" "$OVERLAY_COMMIT"
           git checkout --detach "$BASE_SHA"
           git config user.name "git-geeky patched builder"
@@ -111,15 +126,20 @@ jobs:
           git merge-base --is-ancestor "$PATCH_BASE_SHA" "$PR_HEAD"
           git diff --name-only "$PATCH_BASE_SHA..$PR_HEAD" > /tmp/pr-files
           test "$(wc -l < /tmp/pr-files)" -eq 5
-          diff -u <(printf '%s\n' $PATCH_INVENTORY) /tmp/pr-files
-          git diff --binary "$PATCH_BASE_SHA..$PR_HEAD" -- $PATCH_INVENTORY > /tmp/reader-health.patch
+          diff -u <(printf '%s\n' $UPSTREAM_PATCH_INVENTORY) /tmp/pr-files
+          git diff --binary "$PATCH_BASE_SHA..$PR_HEAD" -- $UPSTREAM_PATCH_INVENTORY > /tmp/upstream-reader-health.patch
+          test "$(git rev-parse "$PATCH_COMMIT^")" = "$BASE_SHA"
+          git diff --name-only "$BASE_SHA..$PATCH_COMMIT" > /tmp/patch-files
+          test "$(wc -l < /tmp/patch-files)" -eq 6
+          diff -u <(printf '%s\n' $PATCH_INVENTORY) /tmp/patch-files
+          git diff --binary "$BASE_SHA..$PATCH_COMMIT" -- $PATCH_INVENTORY > /tmp/reader-health.patch
           git apply --3way --index /tmp/reader-health.patch
           git diff --cached --name-only | diff -u <(printf '%s\n' $PATCH_INVENTORY) -
           git commit -m "build: apply reviewed reader-health patch"
-          test "$(git rev-parse "$OVERLAY_COMMIT^")" = "$PR_HEAD"
-          git diff --name-only "$PR_HEAD..$OVERLAY_COMMIT" > /tmp/overlay-files
+          test "$(git rev-parse "$OVERLAY_COMMIT^")" = "$PATCH_COMMIT"
+          git diff --name-only "$PATCH_COMMIT..$OVERLAY_COMMIT" > /tmp/overlay-files
           diff -u <(printf '%s\n' $OVERLAY_INVENTORY) /tmp/overlay-files
-          git diff --binary "$PR_HEAD..$OVERLAY_COMMIT" -- $OVERLAY_INVENTORY > /tmp/reader-health-overlay.patch
+          git diff --binary "$PATCH_COMMIT..$OVERLAY_COMMIT" -- $OVERLAY_INVENTORY > /tmp/reader-health-overlay.patch
           git apply --3way --index /tmp/reader-health-overlay.patch
           git diff --cached --name-only | diff -u <(printf '%s\n' $OVERLAY_INVENTORY) -
           git commit -m "build: add reviewed Premiumize observability overlay"
@@ -127,6 +147,7 @@ jobs:
           git tag -a "patched-$LANE-${GITHUB_RUN_ID}" -m "patched $LANE source tuple"
           echo "SYNTHETIC_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "SYNTHETIC_TREE=$(git rev-parse HEAD^{tree})" >> "$GITHUB_ENV"
+          echo "UPSTREAM_PATCH_DIGEST=$(sha256sum /tmp/upstream-reader-health.patch | awk '{print $1}')" >> "$GITHUB_ENV"
           echo "PATCH_DIGEST=$(sha256sum /tmp/reader-health.patch | awk '{print $1}')" >> "$GITHUB_ENV"
           echo "OVERLAY_DIGEST=$(sha256sum /tmp/reader-health-overlay.patch | awk '{print $1}')" >> "$GITHUB_ENV"
 
@@ -146,9 +167,12 @@ jobs:
           corepack enable
           pnpm install --frozen-lockfile
           pnpm exec prettier --check \
+            packages/core/src/usenet/integration/dashboard/provider-health.ts \
             packages/core/src/usenet/integration/dashboard/providers.ts \
             packages/core/src/usenet/integration/dashboard/stats.ts \
             packages/core/src/usenet/nntp/connection.ts \
+            packages/core/src/usenet/nntp/errors.test.ts \
+            packages/core/src/usenet/nntp/errors.ts \
             packages/core/src/usenet/nntp/health-probe.test.ts \
             packages/core/src/usenet/nntp/provider-worker-pool.ts \
             packages/core/src/usenet/types.ts \
@@ -166,6 +190,7 @@ jobs:
           PATCH_BASE_SHA: ${{ inputs.patch_base_sha }}
           OFFICIAL_DIGEST: ${{ inputs.official_digest }}
           PR_HEAD: ${{ inputs.pr_head }}
+          PATCH_COMMIT: ${{ inputs.patch_commit }}
           OVERLAY_COMMIT: ${{ inputs.overlay_commit }}
           APPROVAL_DIGEST: ${{ inputs.approval_artifact_digest }}
         shell: bash
@@ -181,6 +206,7 @@ jobs:
             --label "io.aiostreams.upstream-base=${{ inputs.base_sha }}" \
             --label "io.aiostreams.patch-base=${{ inputs.patch_base_sha }}" \
             --label "io.aiostreams.pr-head=${{ inputs.pr_head }}" \
+            --label "io.aiostreams.patch-transplant=${{ inputs.patch_commit }}" \
             --label "io.aiostreams.overlay-commit=${{ inputs.overlay_commit }}" \
             --label "io.aiostreams.official-rollback=${{ inputs.official_digest }}" \
             --label "io.aiostreams.approval-artifact=${{ inputs.approval_artifact_digest }}" \
@@ -201,13 +227,15 @@ jobs:
               sizes.append(int(float(m.group(1))*scale))
           if not sizes: raise SystemExit('missing uncompressed layer bounds')
           payload = {
-              'version': 1, 'platform': 'linux/amd64', 'lane': os.environ['LANE'],
+              'version': 2, 'platform': 'linux/amd64', 'lane': os.environ['LANE'],
               'syntheticCommit': os.environ['SYNTHETIC_COMMIT'],
               'syntheticTree': os.environ['SYNTHETIC_TREE'],
+              'upstreamPatchDigest': os.environ['UPSTREAM_PATCH_DIGEST'],
               'patchDigest': os.environ['PATCH_DIGEST'],
               'overlayDigest': os.environ['OVERLAY_DIGEST'],
               'baseSha': os.environ['BASE_SHA'], 'prHead': os.environ['PR_HEAD'],
               'patchBaseSha': os.environ['PATCH_BASE_SHA'],
+              'patchCommit': os.environ['PATCH_COMMIT'],
               'overlayCommit': os.environ['OVERLAY_COMMIT'],
               'officialRollbackDigest': os.environ['OFFICIAL_DIGEST'],
               'approvalArtifactDigest': os.environ['APPROVAL_DIGEST'],
